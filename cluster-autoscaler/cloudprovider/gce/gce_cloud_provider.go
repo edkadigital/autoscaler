@@ -24,14 +24,28 @@ import (
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/config"
-	coreoptions "k8s.io/autoscaler/cluster-autoscaler/core/options"
-	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
+	"k8s.io/client-go/informers"
 	klog "k8s.io/klog/v2"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider/builder"
+	"sigs.k8s.io/cluster-autoscaler/pkg/config"
+	coreoptions "sigs.k8s.io/cluster-autoscaler/pkg/core/options"
+	"sigs.k8s.io/cluster-autoscaler/pkg/processors/nodegroupset"
+	"sigs.k8s.io/cluster-autoscaler/pkg/processors/nodeinfosprovider"
+	"sigs.k8s.io/cluster-autoscaler/pkg/simulator/framework"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/errors"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/gpu"
 )
+
+// ProviderName is the cloud provider name for this provider.
+const ProviderName = "gce"
+
+func init() {
+	builder.RegisterCloudProvider(ProviderName, func(opts *coreoptions.AutoscalerOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter, informerFactory informers.SharedInformerFactory) cloudprovider.CloudProvider {
+		return BuildGCE(opts, do, rl)
+	})
+	builder.SetDefaultCloudProvider(ProviderName)
+}
 
 const (
 	// GPULabel is the label added to nodes with GPU resource.
@@ -69,7 +83,7 @@ func (gce *GceCloudProvider) Cleanup() error {
 
 // Name returns name of the cloud provider.
 func (gce *GceCloudProvider) Name() string {
-	return cloudprovider.GceProviderName
+	return ProviderName
 }
 
 // GPULabel returns the label added to nodes with GPU resource.
@@ -117,7 +131,13 @@ func (gce *GceCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.N
 		return nil, err
 	}
 	mig, err := gce.gceManager.GetMigForInstance(ref)
-	return mig, err
+	if err != nil {
+		return nil, err
+	}
+	if mig == nil {
+		return nil, nil
+	}
+	return mig, nil
 }
 
 // HasInstance returns whether a given node has a corresponding instance in this cloud provider
@@ -201,6 +221,8 @@ type Mig interface {
 	cloudprovider.NodeGroup
 
 	GceRef() GceRef
+	// IsStable returns whether the MIG is stable. A stable state means that: none of the instances in the managed instance group is currently undergoing any type of change (for example, creation, restart, or deletion); no future changes are scheduled for instances in the managed instance group; and the managed instance group itself is not being modified.
+	IsStable() (bool, error)
 }
 
 type gceMig struct {
@@ -215,6 +237,11 @@ type gceMig struct {
 // GceRef returns Mig's GceRef
 func (mig *gceMig) GceRef() GceRef {
 	return mig.gceRef
+}
+
+// IsStable returns whether the MIG is stable. A stable state means that: none of the instances in the managed instance group is currently undergoing any type of change (for example, creation, restart, or deletion); no future changes are scheduled for instances in the managed instance group; and the managed instance group itself is not being modified.
+func (mig *gceMig) IsStable() (bool, error) {
+	return mig.gceManager.IsMigStable(mig)
 }
 
 // MaxSize returns maximum size of the node group.
@@ -383,7 +410,7 @@ func (mig *gceMig) TemplateNodeInfo() (*framework.NodeInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	nodeInfo := framework.NewNodeInfo(node, nil, &framework.PodInfo{Pod: cloudprovider.BuildKubeProxy(mig.Id())})
+	nodeInfo := framework.NewNodeInfo(node, nil, framework.NewPodInfo(cloudprovider.BuildKubeProxy(mig.Id()), nil))
 	return nodeInfo, nil
 }
 
@@ -411,5 +438,14 @@ func BuildGCE(opts *coreoptions.AutoscalerOptions, do cloudprovider.NodeGroupDis
 	}
 	// Register GCE API usage metrics.
 	RegisterMetrics()
+
+	// Configure GCE specific processors
+	if opts.Processors != nil {
+		opts.Processors.TemplateNodeInfoProvider = nodeinfosprovider.NewAnnotationNodeInfoProvider(&opts.AutoscalingOptions.NodeInfoCacheExpireTime, opts.AutoscalingOptions.ForceDaemonSets)
+		opts.Processors.NodeGroupSetProcessor = &nodegroupset.BalancingNodeGroupSetProcessor{
+			Comparator: nodegroupset.CreateGceNodeInfoComparator(opts.AutoscalingOptions.BalancingExtraIgnoredLabels, opts.AutoscalingOptions.NodeGroupSetRatios),
+		}
+	}
+
 	return provider
 }

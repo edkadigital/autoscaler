@@ -76,6 +76,7 @@ To create a valid configuration, follow instructions for your cloud provider:
 - [Exoscale](#exoscale)
 - [Hetzner Cloud](#hetzner-cloud)
 - [Civo](#civo)
+- [Vultr](#vultr)
 
 ### Templating the autoDiscovery.clusterName
 
@@ -302,6 +303,25 @@ Otherwise specify the following parameters:
 
 Read [cluster-autoscaler/cloudprovider/civo/README.md](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/civo/README.md) for further information on the setup without helm.
 
+### Vultr
+
+The following parameters are required:
+
+- `cloudProvider=vultr`
+- `cloudConfigPath=/etc/kubernetes/cloud-config`
+
+A Vultr cloud configuration file must be provided as a valid JSON file. It contains the Vultr API token and the VKE cluster ID.
+
+The JSON configuration file supports the following fields:
+
+```JSON
+{
+  "cluster_id": "<VKE_CLUSTER_ID>",
+  "token": "<VULTR_API_KEY>"
+}
+```
+Read [cluster-autoscaler/cloudprovider/vultr/README.md](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/vultr/README.md) for further information on the setup without helm.
+
 ## Uninstalling the Chart
 
 To uninstall `my-release`:
@@ -442,6 +462,7 @@ vpa:
 | azureClientID | string | `""` | Service Principal ClientID with contributor permission to Cluster and Node ResourceGroup. Required if `cloudProvider=azure` |
 | azureClientSecret | string | `""` | Service Principal ClientSecret with contributor permission to Cluster and Node ResourceGroup. Required if `cloudProvider=azure` |
 | azureEnableForceDelete | bool | `false` | Whether to force delete VMs or VMSS instances when scaling down. |
+| azureEnableVMSSEtag | bool | `false` | Whether to send the cached VMSS ETag as an `If-Match` header on capacity updates, so concurrent modifications are rejected (HTTP 412) and retried instead of silently overwritten. |
 | azureResourceGroup | string | `""` | Azure resource group that the cluster is located. Required if `cloudProvider=azure` |
 | azureSubscriptionID | string | `""` | Azure subscription where the resources are located. Required if `cloudProvider=azure` |
 | azureTenantID | string | `""` | Azure tenant where the resources are located. Required if `cloudProvider=azure` |
@@ -482,7 +503,7 @@ vpa:
 | image.pullPolicy | string | `"IfNotPresent"` | Image pull policy |
 | image.pullSecrets | list | `[]` | Image pull secrets |
 | image.repository | string | `"registry.k8s.io/autoscaling/cluster-autoscaler"` | Image repository |
-| image.tag | string | `"v1.34.2"` | Image tag |
+| image.tag | string | `"v1.35.0"` | Image tag |
 | initContainers | list | `[]` | Any additional init containers. |
 | kubeTargetVersionOverride | string | `""` | Allow overriding the `.Capabilities.KubeVersion.GitVersion` check. Useful for `helm template` commands. |
 | kwokConfigMapName | string | `"kwok-provider-config"` | configmap for configuring kwok provider |

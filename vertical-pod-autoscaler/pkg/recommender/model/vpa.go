@@ -17,13 +17,14 @@ limitations under the License.
 package model
 
 import (
+	"cmp"
 	"maps"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
-	autoscaling "k8s.io/api/autoscaling/v1"
-	apiv1 "k8s.io/api/core/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
@@ -48,9 +49,9 @@ func (conditionsMap *vpaConditionsMap) Set(
 		Message: message,
 	}
 	if status {
-		condition.Status = apiv1.ConditionTrue
+		condition.Status = corev1.ConditionTrue
 	} else {
-		condition.Status = apiv1.ConditionFalse
+		condition.Status = corev1.ConditionFalse
 	}
 	if alreadyPresent && oldCondition.Status == condition.Status {
 		condition.LastTransitionTime = oldCondition.LastTransitionTime
@@ -68,8 +69,8 @@ func (conditionsMap *vpaConditionsMap) AsList() []vpa_types.VerticalPodAutoscale
 	}
 
 	// Sort conditions by type to avoid elements floating on the list
-	sort.Slice(conditions, func(i, j int) bool {
-		return conditions[i].Type < conditions[j].Type
+	slices.SortFunc(conditions, func(a, b vpa_types.VerticalPodAutoscalerCondition) int {
+		return cmp.Compare(a.Type, b.Type)
 	})
 
 	return conditions
@@ -77,7 +78,7 @@ func (conditionsMap *vpaConditionsMap) AsList() []vpa_types.VerticalPodAutoscale
 
 func (conditionsMap *vpaConditionsMap) ConditionActive(conditionType vpa_types.VerticalPodAutoscalerConditionType) bool {
 	condition, found := (*conditionsMap)[conditionType]
-	return found && condition.Status == apiv1.ConditionTrue
+	return found && condition.Status == corev1.ConditionTrue
 }
 
 // ConditionActive returns true if the condition is present and active.
@@ -202,12 +203,15 @@ type Vpa struct {
 	// APIVersion of the VPA object.
 	APIVersion string
 	// TargetRef points to the controller managing the set of pods.
-	TargetRef *autoscaling.CrossVersionObjectReference
+	TargetRef *autoscalingv1.CrossVersionObjectReference
 	// PodCount contains number of live Pods matching a given VPA object.
 	PodCount int
 
 	// mutex protects concurrent access to conditions and recommendation fields
 	mutex sync.RWMutex
+
+	// Generation is the generation of the VPA object observed by the recommender.
+	Generation int64
 }
 
 // NewVpa returns a new Vpa with a given ID and pod selector. Doesn't set the
@@ -228,6 +232,7 @@ func NewVpa(id VpaID, selector labels.Selector, created time.Time) *Vpa {
 		// to the version requested by the client server side.
 		APIVersion: vpa_types.SchemeGroupVersion.Version,
 		PodCount:   0,
+		Generation: 0,
 	}
 	return vpa
 }
@@ -378,6 +383,7 @@ func (vpa *Vpa) AsStatus() *vpa_types.VerticalPodAutoscalerStatus {
 	if vpa.recommendation != nil {
 		status.Recommendation = vpa.recommendation
 	}
+	status.ObservedGeneration = &vpa.Generation
 	return status
 }
 
@@ -388,7 +394,7 @@ func (vpa *Vpa) HasMatchedPods() bool {
 	vpa.mutex.RLock()
 	defer vpa.mutex.RUnlock()
 	noPodsMatched, found := vpa.conditions[vpa_types.NoPodsMatched]
-	if found && noPodsMatched.Status == apiv1.ConditionTrue {
+	if found && noPodsMatched.Status == corev1.ConditionTrue {
 		return false
 	}
 	return true

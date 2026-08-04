@@ -24,18 +24,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"k8s.io/utils/ptr"
 
 	azerrors "github.com/Azure/azure-sdk-for-go-extensions/pkg/errors"
 	apiv1 "k8s.io/api/core/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/config"
-	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
-	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 	klog "k8s.io/klog/v2"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
+	"sigs.k8s.io/cluster-autoscaler/pkg/config"
+	"sigs.k8s.io/cluster-autoscaler/pkg/config/dynamic"
+	"sigs.k8s.io/cluster-autoscaler/pkg/simulator/framework"
 )
 
 const (
@@ -435,8 +435,15 @@ func (as *AgentPool) DeleteInstances(instances []*azureRef) error {
 			return err
 		}
 
+		if !as.manager.config.StrictCacheUpdates {
+			as.manager.azureCache.setInstanceStateByProviderID(instance.Name, cloudprovider.InstanceDeleting)
+		}
+
 		err = as.deleteVirtualMachine(name)
 		if err != nil {
+			// The delete failed, so force a cache refresh on the next loop to
+			// reconcile any stale local cache state.
+			as.manager.invalidateCache()
 			klog.Errorf("Delete virtual machine %q failed: %v", name, err)
 			return err
 		}
@@ -518,7 +525,12 @@ func (as *AgentPool) Nodes() ([]cloudprovider.Instance, error) {
 		if err != nil {
 			return nil, err
 		}
-		nodes = append(nodes, cloudprovider.Instance{Id: resourceID})
+		var provisioningState *string
+		if instance.Properties != nil {
+			provisioningState = instance.Properties.ProvisioningState
+		}
+		status := instanceStatusFromProvisioningStateAndPowerState(resourceID, provisioningState, vmPowerStateRunning, disableFastDeleteOnFailure)
+		nodes = append(nodes, cloudprovider.Instance{Id: resourceID, Status: status})
 	}
 
 	return nodes, nil

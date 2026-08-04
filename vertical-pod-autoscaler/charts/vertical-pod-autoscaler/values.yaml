@@ -13,6 +13,8 @@ commonLabels: {}
 rbac:
   # If `true`, create `ClusterRole` & `ClusterRoleBinding` resources to enable access to the Kubernetes API.
   create: true
+  # extraRules -- Additional rules to add to the ClusterRole
+  extraRules: []
 
 podSecurityContext:
   runAsNonRoot: true
@@ -22,6 +24,10 @@ containerSecurityContext: {}
 
 admissionController:
   enabled: true
+
+  # Annotations to add to the Admission Controller deployment.
+  annotations: {}
+
   image:
     # Image repository for the Admission Controller default container.
     repository: registry.k8s.io/autoscaling/vpa-admission-controller
@@ -49,6 +55,9 @@ admissionController:
 
   # Number of Admission Controller replicas to create.
   replicas: 2
+
+  # The number of old history revisions to retain to allow rollback.
+  revisionHistoryLimit: 10
 
   # Labels to add to the Admission Controller pod.
   podLabels: {}
@@ -127,6 +136,43 @@ admissionController:
     tolerations: []
     affinity: {}
 
+  certManager:
+    # admissionController.certManager.enabled -- If true, cert-manager manages the webhook certificate lifecycle.
+    # cert-manager must be installed in the cluster, see https://cert-manager.io/docs/installation.
+    # Mutually exclusive with certGen.enabled, registerWebhook, and tls.create.
+    enabled: false
+    # admissionController.certManager.createSelfSignedIssuer -- Optionally create a SelfSigned Issuer for CA generation.
+    # When enabled, a namespaced SelfSigned Issuer is created in the VPA namespace to issue the intermediate CA certificate,
+    # which in turn signs the webhook TLS certificate.
+    createSelfSignedIssuer:
+      enabled: false
+      # admissionController.certManager.createSelfSignedIssuer.duration -- Lifetime of the intermediate CA certificate.
+      duration: 8760h
+      # admissionController.certManager.createSelfSignedIssuer.renewBefore -- Time before expiry to renew the CA certificate.
+      renewBefore: 720h
+    # admissionController.certManager.issuerRef -- Reference to an existing issuer for signing the webhook TLS certificate.
+    # Required when createSelfSignedIssuer.enabled is false.
+    issuerRef:
+      # admissionController.certManager.issuerRef.name -- Name of the issuer.
+      name: ""
+      # admissionController.certManager.issuerRef.kind -- Kind of the issuer (ClusterIssuer or Issuer).
+      kind: ClusterIssuer
+      # admissionController.certManager.issuerRef.group -- API group of the issuer.
+      group: cert-manager.io
+
+    # admissionController.certManager.duration -- Lifetime of the webhook TLS certificate.
+    duration: 168h
+    # admissionController.certManager.renewBefore -- Time before expiry to renew the TLS certificate.
+    renewBefore: 24h
+
+    privateKey:
+      # admissionController.certManager.privateKey.algorithm -- Key algorithm for certificates (RSA, ECDSA, Ed25519).
+      algorithm: RSA
+      # admissionController.certManager.privateKey.size -- Key size for RSA or ECDSA. Ignored for Ed25519.
+      size: 2048
+    # admissionController.certManager.annotations -- Annotations to add to all cert-manager resources created by Chart.
+    annotations: {}
+
   mutatingWebhookConfiguration:
     # admissionController.mutatingWebhookConfiguration.annotations -- Additional annotations for the MutatingWebhookConfiguration
     annotations: {}
@@ -183,6 +229,10 @@ admissionController:
 
 recommender:
   enabled: true
+
+  # Annotations to add to the Recommender deployment.
+  annotations: {}
+
   image:
     # Image repository for the Recommender default container.
     repository: registry.k8s.io/autoscaling/vpa-recommender
@@ -201,6 +251,9 @@ recommender:
 
   # Number of Recommender replicas to create.
   replicas: 2
+
+  # The number of old history revisions to retain to allow rollback.
+  revisionHistoryLimit: 10
 
   # Labels to add to the Recommender pod.
   podLabels: {}
@@ -277,8 +330,12 @@ recommender:
 updater:
   enabled: true
 
+  # Annotations to add to the Updater deployment.
+  annotations: {}
+
   # Additional args for the updater
-  extraArgs: []
+  extraArgs:
+    - --in-place-skip-disruption-budget=true
 
   image:
     # Image repository for the Updater default container.
@@ -290,6 +347,9 @@ updater:
 
   # Number of Updater replicas to create.
   replicas: 2
+
+  # The number of old history revisions to retain to allow rollback.
+  revisionHistoryLimit: 10
 
   # Labels to add to the Updater pod.
   podLabels: {}

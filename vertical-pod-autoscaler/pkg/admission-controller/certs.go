@@ -32,11 +32,6 @@ import (
 	"k8s.io/klog/v2"
 )
 
-type certsConfig struct {
-	clientCaFile, tlsCertFile, tlsPrivateKey *string
-	reload                                   *bool
-}
-
 func readFile(filePath string) []byte {
 	res, err := os.ReadFile(filePath)
 	if err != nil {
@@ -130,6 +125,15 @@ func (cr *certReloader) reloadWebhookCA() error {
 		// this should never happen as we don't watch the file if mutatingWebhookClient is nil
 		return errors.New("webhook client is not set")
 	}
+	newBundle := readFile(cr.clientCaPath)
+	// The CA file may transiently appear empty when it is rewritten via
+	// O_TRUNC + Write; fsnotify can deliver an event for the truncate
+	// before the write completes. Skip the reload in that case to avoid
+	// patching the webhook with an empty CA bundle.
+	if len(newBundle) == 0 {
+		klog.V(2).InfoS("Client CA file is empty, skipping reload")
+		return nil
+	}
 	webhook, err := client.Get(context.TODO(), webhookConfigName, metav1.GetOptions{})
 	if err != nil {
 		return err
@@ -142,7 +146,6 @@ func (cr *certReloader) reloadWebhookCA() error {
 	}
 	currentBundle := webhook.Webhooks[0].ClientConfig.CABundle[:]
 	base64CurrentBundle := base64.StdEncoding.EncodeToString(currentBundle)
-	newBundle := readFile(cr.clientCaPath)
 	base64NewBundle := base64.StdEncoding.EncodeToString(newBundle)
 	// make sure clientCA actually changed
 	if base64CurrentBundle == base64NewBundle {

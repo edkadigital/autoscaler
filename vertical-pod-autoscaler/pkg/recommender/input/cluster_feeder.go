@@ -18,19 +18,20 @@ package input
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
 
-	apiv1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	kube_client "k8s.io/client-go/kubernetes"
-	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	v1lister "k8s.io/client-go/listers/core/v1"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
@@ -44,6 +45,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/client"
 	metrics_recommender "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/recommender"
 )
 
@@ -71,6 +73,9 @@ type ClusterStateFeeder interface {
 	// LoadRealTimeMetrics updates clusterState with current usage metrics of containers.
 	LoadRealTimeMetrics(ctx context.Context)
 
+	// DeleteRemovedPods deletes pods that were identified as removed in the last LoadPods call.
+	DeleteRemovedPods()
+
 	// GarbageCollectCheckpoints removes historical checkpoints that don't have a matching VPA.
 	GarbageCollectCheckpoints(ctx context.Context)
 }
@@ -83,7 +88,7 @@ type ClusterStateFeederFactory struct {
 	VpaCheckpointClient vpa_api.VerticalPodAutoscalerCheckpointsGetter
 	VpaCheckpointLister vpa_lister.VerticalPodAutoscalerCheckpointLister
 	VpaLister           vpa_lister.VerticalPodAutoscalerLister
-	PodLister           v1lister.PodLister
+	PodLister           listersv1.PodLister
 	OOMObserver         oom.Observer
 	SelectorFetcher     target.VpaTargetSelectorFetcher
 	MemorySaveMode      bool
@@ -91,6 +96,7 @@ type ClusterStateFeederFactory struct {
 	RecommenderName     string
 	IgnoredNamespaces   []string
 	VpaObjectNamespace  string
+	podsToDelete        []model.PodID
 }
 
 // Make creates new ClusterStateFeeder with internal data providers, based on kube client.
@@ -110,6 +116,7 @@ func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
 		recommenderName:     m.RecommenderName,
 		ignoredNamespaces:   m.IgnoredNamespaces,
 		vpaObjectNamespace:  m.VpaObjectNamespace,
+		podsToDelete:        m.podsToDelete,
 	}
 }
 
@@ -138,7 +145,11 @@ func WatchEvictionEventsWithRetries(ctx context.Context, kubeClient kube_client.
 				// Wait between attempts, retrying too often breaks API server.
 				waitTime := wait.Jitter(evictionWatchRetryWait, evictionWatchJitterFactor)
 				klog.V(1).InfoS("An attempt to watch eviction events finished", "waitTime", waitTime)
-				time.Sleep(waitTime)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(waitTime):
+				}
 			}
 		}
 	}()
@@ -152,7 +163,7 @@ func watchEvictionEvents(evictedEventChan <-chan watch.Event, observer oom.Obser
 			return
 		}
 		if evictedEvent.Type == watch.Added {
-			evictedEvent, ok := evictedEvent.Object.(*apiv1.Event)
+			evictedEvent, ok := evictedEvent.Object.(*corev1.Event)
 			if !ok {
 				continue
 			}
@@ -162,7 +173,7 @@ func watchEvictionEvents(evictedEventChan <-chan watch.Event, observer oom.Obser
 }
 
 // Creates clients watching pods: PodLister (listing only not terminated pods).
-func newPodClients(kubeClient kube_client.Interface, resourceEventHandler cache.ResourceEventHandler, namespace string, stopCh <-chan struct{}) v1lister.PodLister {
+func newPodClients(kubeClient kube_client.Interface, resourceEventHandler cache.ResourceEventHandler, namespace string, stopCh <-chan struct{}) listersv1.PodLister {
 	// We are interested in pods which are Running or Unknown (in case the pod is
 	// running but there are some transient errors we don't want to delete it from
 	// our model).
@@ -170,14 +181,15 @@ func newPodClients(kubeClient kube_client.Interface, resourceEventHandler cache.
 	// yet.
 	// Succeeded and Failed failed pods don't generate any usage anymore but we
 	// don't necessarily want to immediately delete them.
-	selector := fields.ParseSelectorOrDie("status.phase!=" + string(apiv1.PodPending))
+	selector := fields.ParseSelectorOrDie("status.phase!=" + string(corev1.PodPending))
 	podListWatch := cache.NewListWatchFromClient(kubeClient.CoreV1().RESTClient(), "pods", namespace, selector)
 	informerOptions := cache.InformerOptions{
-		ObjectType:    &apiv1.Pod{},
+		ObjectType:    &corev1.Pod{},
 		ListerWatcher: podListWatch,
 		Handler:       resourceEventHandler,
 		ResyncPeriod:  time.Hour,
 		Indexers:      cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+		Transform:     client.StripManagedFields,
 	}
 
 	store, controller := cache.NewInformerWithOptions(informerOptions)
@@ -186,7 +198,7 @@ func newPodClients(kubeClient kube_client.Interface, resourceEventHandler cache.
 		klog.ErrorS(nil, "Expected Indexer, but got a Store that does not implement Indexer")
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
-	podLister := v1lister.NewPodLister(indexer)
+	podLister := listersv1.NewPodLister(indexer)
 	go controller.Run(stopCh)
 	if !cache.WaitForCacheSync(stopCh, controller.HasSynced) {
 		klog.ErrorS(nil, "Failed to sync Pod cache during initialization")
@@ -195,7 +207,7 @@ func newPodClients(kubeClient kube_client.Interface, resourceEventHandler cache.
 }
 
 // NewPodListerAndOOMObserver creates pair of pod lister and OOM observer.
-func NewPodListerAndOOMObserver(ctx context.Context, kubeClient kube_client.Interface, namespace string, stopCh <-chan struct{}) (v1lister.PodLister, oom.Observer) {
+func NewPodListerAndOOMObserver(ctx context.Context, kubeClient kube_client.Interface, namespace string, stopCh <-chan struct{}) (listersv1.PodLister, oom.Observer) {
 	oomObserver := oom.NewObserver()
 	podLister := newPodClients(kubeClient, oomObserver, namespace, stopCh)
 	WatchEvictionEventsWithRetries(ctx, kubeClient, oomObserver, namespace)
@@ -203,7 +215,7 @@ func NewPodListerAndOOMObserver(ctx context.Context, kubeClient kube_client.Inte
 }
 
 type clusterStateFeeder struct {
-	coreClient          corev1.CoreV1Interface
+	coreClient          typedcorev1.CoreV1Interface
 	specClient          spec.SpecClient
 	metricsClient       metrics.MetricsClient
 	oomChan             <-chan oom.OomInfo
@@ -217,6 +229,7 @@ type clusterStateFeeder struct {
 	recommenderName     string
 	ignoredNamespaces   []string
 	vpaObjectNamespace  string
+	podsToDelete        []model.PodID
 }
 
 func (feeder *clusterStateFeeder) InitFromHistoryProvider(historyProvider history.HistoryProvider) {
@@ -227,7 +240,7 @@ func (feeder *clusterStateFeeder) InitFromHistoryProvider(historyProvider histor
 	}
 	for podID, podHistory := range clusterHistory {
 		klog.V(4).InfoS("Adding pod with labels", "pod", podID, "labels", podHistory.LastLabels)
-		feeder.clusterState.AddOrUpdatePod(podID, podHistory.LastLabels, apiv1.PodUnknown)
+		feeder.clusterState.AddOrUpdatePod(podID, podHistory.LastLabels, corev1.PodUnknown)
 		for containerName, sampleList := range podHistory.Samples {
 			containerID := model.ContainerID{
 				PodID:         podID,
@@ -270,11 +283,11 @@ func (feeder *clusterStateFeeder) InitFromCheckpoints(ctx context.Context) {
 	klog.V(3).InfoS("Initializing VPA from checkpoints")
 	feeder.LoadVPAs(ctx)
 
-	klog.V(3).InfoS("Fetching VPA checkpoints")
 	checkpointList, err := feeder.vpaCheckpointLister.List(labels.Everything())
 	if err != nil {
 		klog.ErrorS(err, "Cannot list VPA checkpoints")
 	}
+	klog.V(3).InfoS("Fetching VPA checkpoints", "count", len(checkpointList))
 
 	namespaces := make(map[string]bool)
 	for _, v := range feeder.clusterState.VPAs() {
@@ -361,7 +374,7 @@ func (feeder *clusterStateFeeder) cleanupCheckpointsForNamespace(ctx context.Con
 		vpaID := model.VpaID{Namespace: checkpoint.Namespace, VpaName: checkpoint.Spec.VPAObjectName}
 		if !allVPAKeys[vpaID] {
 			if errFeeder := feeder.vpaCheckpointClient.VerticalPodAutoscalerCheckpoints(namespace).Delete(ctx, checkpoint.Name, metav1.DeleteOptions{}); errFeeder != nil {
-				err = fmt.Errorf("failed to delete orphaned checkpoint %s: %w", klog.KRef(namespace, checkpoint.Name), err)
+				err = errors.Join(err, fmt.Errorf("failed to delete orphaned checkpoint %s: %w", klog.KRef(namespace, checkpoint.Name), errFeeder))
 				continue
 			}
 			klog.V(3).InfoS("Orphaned VPA checkpoint cleanup - deleting", "checkpoint", klog.KRef(namespace, checkpoint.Name))
@@ -467,16 +480,19 @@ func (feeder *clusterStateFeeder) LoadVPAs(ctx context.Context) {
 func (feeder *clusterStateFeeder) LoadPods() {
 	podSpecs, err := feeder.specClient.GetPodSpecs()
 	if err != nil {
-		klog.ErrorS(err, "Cannot get SimplePodSpecs")
+		klog.ErrorS(err, "Cannot get SimplePodSpecs, skipping LoadPods cycle")
+		return
 	}
 	pods := make(map[model.PodID]*spec.BasicPodSpec)
 	for _, spec := range podSpecs {
 		pods[spec.ID] = spec
 	}
+	feeder.podsToDelete = nil
 	for key := range feeder.clusterState.Pods() {
+		// The pods aren't deleted from the clusterState while loading pods since OomInfo from these removed containers
+		// may still need to be processed. We delete these pods after the OomInfo is processed.
 		if _, exists := pods[key]; !exists {
-			klog.V(3).InfoS("Deleting Pod", "pod", klog.KRef(key.Namespace, key.PodName))
-			feeder.clusterState.DeletePod(key)
+			feeder.podsToDelete = append(feeder.podsToDelete, key)
 		}
 	}
 	for _, pod := range pods {
@@ -489,11 +505,23 @@ func (feeder *clusterStateFeeder) LoadPods() {
 				klog.V(0).InfoS("Failed to add container", "container", container.ID, "error", err)
 			}
 		}
+		initContainerNames := make([]string, 0, len(pod.InitContainers))
 		for _, initContainer := range pod.InitContainers {
-			podInitContainers := feeder.clusterState.Pods()[pod.ID].InitContainers
-			feeder.clusterState.Pods()[pod.ID].InitContainers = append(podInitContainers, initContainer.ID.ContainerName)
+			initContainerNames = append(initContainerNames, initContainer.ID.ContainerName)
+		}
+		if err = feeder.clusterState.SetInitContainers(pod.ID, initContainerNames); err != nil {
+			klog.V(0).InfoS("Failed to set init containers", "pod", klog.KRef(pod.ID.Namespace, pod.ID.PodName), "error", err)
 		}
 	}
+}
+
+// DeleteRemovedPods deletes pods that were identified as removed in the last LoadPods call.
+func (feeder *clusterStateFeeder) DeleteRemovedPods() {
+	for _, key := range feeder.podsToDelete {
+		klog.V(3).InfoS("Deleting Pod", "pod", klog.KRef(key.Namespace, key.PodName))
+		feeder.clusterState.DeletePod(key)
+	}
+	feeder.podsToDelete = nil
 }
 
 func (feeder *clusterStateFeeder) LoadRealTimeMetrics(ctx context.Context) {

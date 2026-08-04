@@ -4,9 +4,9 @@ WARNING: This chart is currently under development and is not ready for producti
 
 Automatically adjust resources for your workloads
 
-![Version: 0.8.0](https://img.shields.io/badge/Version-0.8.0-informational?style=flat-square)
+![Version: 0.11.0](https://img.shields.io/badge/Version-0.11.0-informational?style=flat-square)
 ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
-![AppVersion: 1.5.1](https://img.shields.io/badge/AppVersion-1.5.1-informational?style=flat-square)
+![AppVersion: 1.7.1](https://img.shields.io/badge/AppVersion-1.7.1-informational?style=flat-square)
 
 ## Introduction
 The Vertical Pod Autoscaler (VPA) automatically adjusts the CPU and memory resource requests of pods to match their actual resource utilization.
@@ -26,7 +26,7 @@ helm upgrade -i vertical-pod-autoscaler autoscalers/vertical-pod-autoscaler
 | omerap12 | <kubernetes-sig-autoscaling@googlegroups.com> |  |
 
 ## Webhook Management
-The admission controller requires a `MutatingWebhookConfiguration` and TLS certificates. This chart supports two mutually exclusive modes:
+The admission controller requires a `MutatingWebhookConfiguration` and TLS certificates. This chart supports three mutually exclusive modes:
 
 ### Helm-managed (default)
 ```yaml
@@ -51,6 +51,35 @@ In this mode:
 - The VPA admission controller creates and manages the webhook itself
 Important: You are responsible for creating the TLS secret before or after installing the chart. The admission controller will only create the `MutatingWebhookConfiguration` once the secret exists.
 If the secret is created after the Helm install, you must restart the admission controller pod to trigger webhook registration.
+
+### cert-manager managed
+```yaml
+admissionController:
+  registerWebhook: false
+  certGen:
+    enabled: false
+  certManager:
+    enabled: true
+```
+In this mode:
+- Helm creates the MutatingWebhookConfiguration
+- cert-manager issues and renews TLS certificates automatically
+- cert-manager's cainjector injects the CA into the webhook configuration
+
+By default, you must provide an existing `Issuer` or `ClusterIssuer` via `admissionController.certManager.issuerRef`. Alternatively, enable `admissionController.certManager.createSelfSignedIssuer.enabled: true` to let the chart create a namespaced self-signed issuer automatically.
+
+## Custom Resource Definitions
+
+Helm cannot upgrade CustomResourceDefinitions in the `<chart>/crds` folder [by design](https://helm.sh/docs/chart_best_practices/custom_resource_definitions/#some-caveats-and-explanations). When upgrading the chart, the VPA CRDs will not be updated automatically.
+
+If you need to update the CRDs to a newer version, please use `kubectl` to upgrade them manually from the upstream project repo:
+
+```bash
+kubectl apply --server-side -f "https://raw.githubusercontent.com/kubernetes/autoscaler/vertical-pod-autoscaler-<appVersion>/vertical-pod-autoscaler/deploy/vpa-v1-crd-gen.yaml"
+
+# Eg. version v1.7.1
+kubectl apply --server-side -f "https://raw.githubusercontent.com/kubernetes/autoscaler/vertical-pod-autoscaler-1.7.1/vertical-pod-autoscaler/deploy/vpa-v1-crd-gen.yaml"
+```
 
 ## Migration Guides
 
@@ -82,6 +111,7 @@ helm upgrade <release-name> <chart> \
 | admissionController.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.labelSelector.matchExpressions[0].values[0] | string | `"admission-controller"` |  |
 | admissionController.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.topologyKey | string | `"kubernetes.io/hostname"` |  |
 | admissionController.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].weight | int | `100` |  |
+| admissionController.annotations | object | `{}` |  |
 | admissionController.certGen.affinity | object | `{}` |  |
 | admissionController.certGen.enabled | bool | `true` |  |
 | admissionController.certGen.env | object | `{}` | Additional environment variables to be added to the certgen container. Format is KEY: Value format |
@@ -93,6 +123,19 @@ helm upgrade <release-name> <chart> \
 | admissionController.certGen.resources | object | `{}` | The resources block for the certgen pod |
 | admissionController.certGen.securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true}` | The securityContext block for the certgen container(s) |
 | admissionController.certGen.tolerations | list | `[]` |  |
+| admissionController.certManager.annotations | object | `{}` | Annotations to add to all cert-manager resources created by Chart. |
+| admissionController.certManager.createSelfSignedIssuer | object | `{"duration":"8760h","enabled":false,"renewBefore":"720h"}` | Optionally create a SelfSigned Issuer for CA generation. When enabled, a namespaced SelfSigned Issuer is created in the VPA namespace to issue the intermediate CA certificate, which in turn signs the webhook TLS certificate. |
+| admissionController.certManager.createSelfSignedIssuer.duration | string | `"8760h"` | Lifetime of the intermediate CA certificate. |
+| admissionController.certManager.createSelfSignedIssuer.renewBefore | string | `"720h"` | Time before expiry to renew the CA certificate. |
+| admissionController.certManager.duration | string | `"168h"` | Lifetime of the webhook TLS certificate. |
+| admissionController.certManager.enabled | bool | `false` | If true, cert-manager manages the webhook certificate lifecycle. cert-manager must be installed in the cluster, see https://cert-manager.io/docs/installation. Mutually exclusive with certGen.enabled, registerWebhook, and tls.create. |
+| admissionController.certManager.issuerRef | object | `{"group":"cert-manager.io","kind":"ClusterIssuer","name":""}` | Reference to an existing issuer for signing the webhook TLS certificate. Required when createSelfSignedIssuer.enabled is false. |
+| admissionController.certManager.issuerRef.group | string | `"cert-manager.io"` | API group of the issuer. |
+| admissionController.certManager.issuerRef.kind | string | `"ClusterIssuer"` | Kind of the issuer (ClusterIssuer or Issuer). |
+| admissionController.certManager.issuerRef.name | string | `""` | Name of the issuer. |
+| admissionController.certManager.privateKey.algorithm | string | `"RSA"` | Key algorithm for certificates (RSA, ECDSA, Ed25519). |
+| admissionController.certManager.privateKey.size | int | `2048` | Key size for RSA or ECDSA. Ignored for Ed25519. |
+| admissionController.certManager.renewBefore | string | `"24h"` | Time before expiry to renew the TLS certificate. |
 | admissionController.enabled | bool | `true` |  |
 | admissionController.extraArgs | list | `[]` |  |
 | admissionController.extraEnv | list | `[]` |  |
@@ -115,6 +158,7 @@ helm upgrade <release-name> <chart> \
 | admissionController.registerWebhook | bool | `false` | Whether to register webhook via the application itself or via Helm. Set to false when using Helm-managed webhook. Security issue: granting delete on mutatingwebhookconfigurations is a potential security risk as it allows the admission controller to remove any webhook configurations. |
 | admissionController.replicas | int | `2` |  |
 | admissionController.resources | object | `{}` |  |
+| admissionController.revisionHistoryLimit | int | `10` |  |
 | admissionController.service.annotations | object | `{}` |  |
 | admissionController.service.name | string | `"vpa-webhook"` |  |
 | admissionController.service.ports[0].port | int | `443` |  |
@@ -149,11 +193,13 @@ helm upgrade <release-name> <chart> \
 | podSecurityContext.runAsNonRoot | bool | `true` |  |
 | podSecurityContext.runAsUser | int | `65534` |  |
 | rbac.create | bool | `true` |  |
+| rbac.extraRules | list | `[]` |  |
 | recommender.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.labelSelector.matchExpressions[0].key | string | `"app.kubernetes.io/component"` |  |
 | recommender.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.labelSelector.matchExpressions[0].operator | string | `"In"` |  |
 | recommender.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.labelSelector.matchExpressions[0].values[0] | string | `"recommender"` |  |
 | recommender.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.topologyKey | string | `"kubernetes.io/hostname"` |  |
 | recommender.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].weight | int | `100` |  |
+| recommender.annotations | object | `{}` |  |
 | recommender.enabled | bool | `true` |  |
 | recommender.extraArgs | list | `[]` |  |
 | recommender.extraEnv | list | `[]` |  |
@@ -175,6 +221,7 @@ helm upgrade <release-name> <chart> \
 | recommender.priorityClassName | string | `nil` |  |
 | recommender.replicas | int | `2` |  |
 | recommender.resources | object | `{}` |  |
+| recommender.revisionHistoryLimit | int | `10` |  |
 | recommender.serviceAccount.annotations | object | `{}` |  |
 | recommender.serviceAccount.create | bool | `true` |  |
 | recommender.serviceAccount.labels | object | `{}` |  |
@@ -184,8 +231,9 @@ helm upgrade <release-name> <chart> \
 | updater.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.labelSelector.matchExpressions[0].values[0] | string | `"updater"` |  |
 | updater.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.topologyKey | string | `"kubernetes.io/hostname"` |  |
 | updater.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].weight | int | `100` |  |
+| updater.annotations | object | `{}` |  |
 | updater.enabled | bool | `true` |  |
-| updater.extraArgs | list | `[]` |  |
+| updater.extraArgs[0] | string | `"--in-place-skip-disruption-budget=true"` |  |
 | updater.image.pullPolicy | string | `"IfNotPresent"` |  |
 | updater.image.repository | string | `"registry.k8s.io/autoscaling/vpa-updater"` |  |
 | updater.image.tag | string | `nil` |  |
@@ -204,6 +252,7 @@ helm upgrade <release-name> <chart> \
 | updater.priorityClassName | string | `nil` |  |
 | updater.replicas | int | `2` |  |
 | updater.resources | object | `{}` |  |
+| updater.revisionHistoryLimit | int | `10` |  |
 | updater.serviceAccount.annotations | object | `{}` |  |
 | updater.serviceAccount.create | bool | `true` |  |
 | updater.serviceAccount.labels | object | `{}` |  |
